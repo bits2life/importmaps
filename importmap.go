@@ -38,6 +38,22 @@ type Source struct {
 	Prefix string // URL prefix, such as "/" or "/_admin/assets".
 }
 
+// Script is a script served outside of any Source, such as one generated at
+// runtime or served by another package's handler. It is added to the import
+// map like files found in a Source, and aliases pointing at it are
+// checksummed too.
+type Script struct {
+	Path string // URL path, such as "/_admin/app.js".
+
+	// Content returns the script's current content, which is checksummed.
+	// If Content is nil, Version is checksummed instead.
+	Content func() ([]byte, error)
+
+	// Version identifies the script's current content, such as a build
+	// hash, for scripts whose content is expensive to read.
+	Version string
+}
+
 // Alias maps an import specifier to a target URL. Targets inside a Source are
 // checksummed like entries from import map files.
 type Alias struct {
@@ -54,6 +70,10 @@ type Options struct {
 	// Sources whose .js and .mjs files are added to the import map. When
 	// prefixes overlap, the longest prefix owns a file.
 	Sources []Source
+
+	// Scripts that no Source can find. They override Source files with the
+	// same path.
+	Scripts []Script
 
 	// Aliases are applied after Files and override them.
 	Aliases []Alias
@@ -144,6 +164,18 @@ func Generate(opts Options) (content string, checksum string, err error) {
 		}
 	}
 
+	scripts := make(map[string]string) // Path -> checksum.
+	for _, script := range opts.Scripts {
+		p := "/" + strings.TrimPrefix(strings.TrimSpace(script.Path), "/")
+		sum, err := script.checksum()
+		if err != nil {
+			log.Warn("importmap: checksumming script", "path", p, "error", err)
+			continue
+		}
+		scripts[p] = sum
+		m.Imports[p] = withChecksum(p, sum)
+	}
+
 	for _, alias := range opts.Aliases {
 		specifier := strings.TrimSpace(alias.Specifier)
 		target := strings.TrimSpace(alias.Target)
@@ -152,9 +184,9 @@ func Generate(opts Options) (content string, checksum string, err error) {
 		}
 	}
 
-	checksumTargets(m.Imports, sources, log)
+	checksumTargets(m.Imports, scripts, sources, log)
 	for _, scope := range m.Scopes {
-		checksumTargets(scope, sources, log)
+		checksumTargets(scope, scripts, sources, log)
 	}
 
 	result, err := json.MarshalIndent(m, "", "  ")
@@ -191,9 +223,13 @@ func (m *Map) merge(src Map) {
 
 // checksumTargets adds a checksum to every local, non-prefix target in
 // imports that doesn't already carry one.
-func checksumTargets(imports map[string]string, sources []source, log *slog.Logger) {
+func checksumTargets(imports map[string]string, scripts map[string]string, sources []source, log *slog.Logger) {
 	for k, v := range imports {
 		if !isLocalTarget(v) || strings.Contains(v, "checksum=") {
+			continue
+		}
+		if sum, ok := scripts[urlPath(v)]; ok {
+			imports[k] = withChecksum(v, sum)
 			continue
 		}
 		src, name, ok := sourceForWebPath(sources, v)
@@ -260,9 +296,15 @@ func (s source) webPath(name string) string {
 	return s.prefix + "/" + strings.TrimPrefix(name, "./")
 }
 
-func sourceForWebPath(sources []source, webPath string) (source, string, bool) {
-	p, _, _ := strings.Cut(webPath, "#")
+// urlPath returns url without its query and fragment.
+func urlPath(url string) string {
+	p, _, _ := strings.Cut(url, "#")
 	p, _, _ = strings.Cut(p, "?")
+	return p
+}
+
+func sourceForWebPath(sources []source, webPath string) (source, string, bool) {
+	p := urlPath(webPath)
 	for _, s := range sources {
 		if s.prefix == "" {
 			if name := strings.TrimPrefix(p, "/"); name != "" {
@@ -278,6 +320,18 @@ func sourceForWebPath(sources []source, webPath string) (source, string, bool) {
 		}
 	}
 	return source{}, "", false
+}
+
+func (s Script) checksum() (string, error) {
+	data := []byte(s.Version)
+	if s.Content != nil {
+		var err error
+		if data, err = s.Content(); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func checksumFile(fsys fs.FS, name string) (string, error) {

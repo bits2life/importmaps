@@ -94,12 +94,38 @@ importmaps := importmap.New(importmap.Options{
 - Local targets (`/path/to/file.js`) in `imports`, `scopes` and aliases get a
   checksum. External URLs and prefix mappings (`"lib/": "/lib/"`) are left
   as they are.
+- `Scripts` registers scripts that no filesystem can find, such as ones a
+  package generates or serves from its own handler (see below).
 - `DisableCache` rebuilds the map on every use, for development. Otherwise
   call `Invalidate` after files change.
 - `ScriptPath` sets the URL `Script()` points at, if you mount the handler
   somewhere other than `/importmap.js`.
 - `Logger` receives warnings about missing files and unresolvable targets
   (default `slog.Default()`).
+
+### Scripts outside any filesystem
+
+A package that serves its own script resources can register them directly.
+They are added to the import map and checksummed like files, and aliases
+pointing at them are checksummed too:
+
+```go
+importmap.Options{
+	Scripts: []importmap.Script{
+		// Checksummed from its content.
+		{Path: "/_widgets/widget.js", Content: widgets.Bundle},
+		// Checksummed from a version string, for content that is
+		// expensive to produce.
+		{Path: "/_widgets/editor.js", Version: widgets.BuildID},
+	},
+	Aliases: []importmap.Alias{
+		{Specifier: "@example/widget", Target: "/_widgets/widget.js"},
+	},
+}
+```
+
+`Content` and `Version` are read whenever the map is generated, so call
+`Invalidate` on the Cache when they change.
 
 Serving the JavaScript files themselves is up to you, for example with
 `http.FileServerFS`, adding a long `Cache-Control` for requests that carry a

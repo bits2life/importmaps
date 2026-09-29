@@ -2,7 +2,10 @@ package importmap
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"io/fs"
+	"log/slog"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -280,4 +283,72 @@ func TestGenerateHandlesSpecialTargets(t *testing.T) {
 	if got := importMap.Integrity["https://cdn.example.com/lib.js"]; got != "sha384-abc" {
 		t.Errorf("integrity not preserved: %q", got)
 	}
+}
+
+func TestGenerateScripts(t *testing.T) {
+	publicFS := fstest.MapFS{
+		"app.js": {Data: []byte(`export {}`)},
+	}
+	content := []byte(`export const v = 1`)
+
+	generate := func() Map {
+		t.Helper()
+		out, _, err := Generate(Options{
+			Sources: []Source{{FS: publicFS, Prefix: "/"}},
+			Scripts: []Script{
+				{Path: "/plugin/widget.js", Content: func() ([]byte, error) { return content, nil }},
+				{Path: "plugin/versioned.js", Version: "build-42"},
+				{Path: "/app.js", Version: "override"},
+				{Path: "/broken.js", Content: func() ([]byte, error) { return nil, errors.New("boom") }},
+			},
+			Aliases: []Alias{
+				{Specifier: "widget", Target: "/plugin/widget.js"},
+				{Specifier: "versioned", Target: "/plugin/versioned.js?v=1"},
+			},
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatalf("Generate() error = %v", err)
+		}
+		var m Map
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("generated invalid JSON: %v", err)
+		}
+		return m
+	}
+
+	m := generate()
+	widget := m.Imports["/plugin/widget.js"]
+	if !strings.HasPrefix(widget, "/plugin/widget.js?checksum=") {
+		t.Errorf("script missing from import map: %q", widget)
+	}
+	if got := m.Imports["widget"]; got != widget {
+		t.Errorf("alias to script = %q, want %q", got, widget)
+	}
+	if got := m.Imports["versioned"]; !strings.HasPrefix(got, "/plugin/versioned.js?v=1&checksum=") {
+		t.Errorf("alias to versioned script not checksummed: %q", got)
+	}
+	if got := m.Imports["/plugin/versioned.js"]; !strings.HasPrefix(got, "/plugin/versioned.js?checksum=") {
+		t.Errorf("path without leading slash not normalized: %q", got)
+	}
+	if got, file := m.Imports["/app.js"], withChecksum("/app.js", mustChecksum(t, publicFS, "app.js")); got == file {
+		t.Errorf("script did not override source file: %q", got)
+	}
+	if _, ok := m.Imports["/broken.js"]; ok {
+		t.Error("script with failing Content should be skipped")
+	}
+
+	content = []byte(`export const v = 2`)
+	if got := generate().Imports["/plugin/widget.js"]; got == widget {
+		t.Errorf("checksum did not change with content: %q", got)
+	}
+}
+
+func mustChecksum(t *testing.T, fsys fs.FS, name string) string {
+	t.Helper()
+	sum, err := checksumFile(fsys, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sum
 }
