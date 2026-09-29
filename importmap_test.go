@@ -2,16 +2,13 @@ package importmap
 
 import (
 	"encoding/json"
-	"errors"
 	"io/fs"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/fstest"
 )
 
-func TestGenerateImportMap(t *testing.T) {
+func TestGenerate(t *testing.T) {
 	publicFS := fstest.MapFS{
 		"importmap.json": {
 			Data: []byte(`{
@@ -28,7 +25,7 @@ func TestGenerateImportMap(t *testing.T) {
 		},
 	}
 
-	importMap, _, err := GenerateImportMap(publicFS, "importmap.json")
+	importMap, _, err := Generate(FromFS(publicFS, "importmap.json"))
 	if err != nil {
 		t.Fatalf("Failed to generate import map: %v", err)
 	}
@@ -73,7 +70,7 @@ func TestGenerateImportMap(t *testing.T) {
 	}
 }
 
-func TestGenerateImportMapPreservesExternalImports(t *testing.T) {
+func TestGeneratePreservesExternalImports(t *testing.T) {
 	publicFS := fstest.MapFS{
 		"importmap.json": {
 			Data: []byte(`{"imports":{"/js/app.js":"/js/app.js","preact":"https://esm.sh/preact"}}`),
@@ -87,15 +84,15 @@ func TestGenerateImportMapPreservesExternalImports(t *testing.T) {
 		},
 	}
 
-	content, checksum, err := GenerateImportMap(publicFS, "importmap.json")
+	content, checksum, err := Generate(FromFS(publicFS, "importmap.json"))
 	if err != nil {
-		t.Fatalf("GenerateImportMap() error = %v", err)
+		t.Fatalf("Generate() error = %v", err)
 	}
 	if checksum == "" {
 		t.Fatal("expected checksum")
 	}
 
-	var importMap ImportMap
+	var importMap Map
 	if err := json.Unmarshal([]byte(content), &importMap); err != nil {
 		t.Fatalf("generated invalid JSON: %v", err)
 	}
@@ -111,7 +108,7 @@ func TestGenerateImportMapPreservesExternalImports(t *testing.T) {
 	}
 }
 
-func TestGenerateImportMapFromSourcesChecksumsMountedFiles(t *testing.T) {
+func TestGenerateChecksumsMountedFiles(t *testing.T) {
 	appFS := fstest.MapFS{
 		"importmap.json": {
 			Data: []byte(`{"imports":{"admin":"/ceyebr/admin/index.js","core":"/main.js"}}`),
@@ -129,18 +126,18 @@ func TestGenerateImportMapFromSourcesChecksumsMountedFiles(t *testing.T) {
 		},
 	}
 
-	content, _, err := GenerateImportMapFromSources(
-		[]ImportmapFile{{FS: appFS, Path: "importmap.json"}},
-		[]FileSource{
+	content, _, err := Generate(Options{
+		Files: []File{{FS: appFS, Path: "importmap.json"}},
+		Sources: []Source{
 			{FS: appFS, Prefix: "/"},
 			{FS: adminFS, Prefix: "/ceyebr"},
 		},
-	)
+	})
 	if err != nil {
-		t.Fatalf("GenerateImportMapFromSources() error = %v", err)
+		t.Fatalf("Generate() error = %v", err)
 	}
 
-	var importMap ImportMap
+	var importMap Map
 	if err := json.Unmarshal([]byte(content), &importMap); err != nil {
 		t.Fatalf("generated invalid JSON: %v", err)
 	}
@@ -153,7 +150,7 @@ func TestGenerateImportMapFromSourcesChecksumsMountedFiles(t *testing.T) {
 	}
 }
 
-func TestGenerateImportMapFromSourcesMergesImportmapFiles(t *testing.T) {
+func TestGenerateMergesImportmapFiles(t *testing.T) {
 	baseFS := fstest.MapFS{
 		"importmap.json": {
 			Data: []byte(`{"imports":{"admin/cms-session":"/ceyebr/admin/cms-session.js","core":"/old-main.js"}}`),
@@ -176,21 +173,21 @@ func TestGenerateImportMapFromSourcesMergesImportmapFiles(t *testing.T) {
 		},
 	}
 
-	content, _, err := GenerateImportMapFromSources(
-		[]ImportmapFile{
+	content, _, err := Generate(Options{
+		Files: []File{
 			{FS: baseFS, Path: "importmap.json"},
 			{FS: previewFS, Path: "importmap.json"},
 		},
-		[]FileSource{
+		Sources: []Source{
 			{FS: previewFS, Prefix: "/"},
 			{FS: adminFS, Prefix: "/ceyebr"},
 		},
-	)
+	})
 	if err != nil {
-		t.Fatalf("GenerateImportMapFromSources() error = %v", err)
+		t.Fatalf("Generate() error = %v", err)
 	}
 
-	var importMap ImportMap
+	var importMap Map
 	if err := json.Unmarshal([]byte(content), &importMap); err != nil {
 		t.Fatalf("generated invalid JSON: %v", err)
 	}
@@ -203,25 +200,26 @@ func TestGenerateImportMapFromSourcesMergesImportmapFiles(t *testing.T) {
 	}
 }
 
-func TestGenerateImportMapFromSourcesChecksumsAliases(t *testing.T) {
+func TestGenerateChecksumsAliases(t *testing.T) {
 	adminFS := fstest.MapFS{
 		"admin/index.js": {
 			Data: []byte(`export const ready = true`),
 		},
 	}
 
-	content, _, err := GenerateImportMapFromSources(
-		nil,
-		[]FileSource{{FS: adminFS, Prefix: "/_admin/assets"}},
-		Alias{Specifier: "@archetype/admin", Target: "/_admin/assets/admin/index.js"},
-		Alias{Specifier: "@archetype/admin/", Target: "/_admin/assets/admin/"},
-		Alias{Specifier: "preact", Target: "https://esm.sh/preact"},
-	)
+	content, _, err := Generate(Options{
+		Sources: []Source{{FS: adminFS, Prefix: "/_admin/assets"}},
+		Aliases: []Alias{
+			{Specifier: "@archetype/admin", Target: "/_admin/assets/admin/index.js"},
+			{Specifier: "@archetype/admin/", Target: "/_admin/assets/admin/"},
+			{Specifier: "preact", Target: "https://esm.sh/preact"},
+		},
+	})
 	if err != nil {
-		t.Fatalf("GenerateImportMapFromSources() error = %v", err)
+		t.Fatalf("Generate() error = %v", err)
 	}
 
-	var importMap ImportMap
+	var importMap Map
 	if err := json.Unmarshal([]byte(content), &importMap); err != nil {
 		t.Fatalf("generated invalid JSON: %v", err)
 	}
@@ -237,7 +235,7 @@ func TestGenerateImportMapFromSourcesChecksumsAliases(t *testing.T) {
 	}
 }
 
-func TestGenerateImportMapHandlesSpecialTargets(t *testing.T) {
+func TestGenerateHandlesSpecialTargets(t *testing.T) {
 	publicFS := fstest.MapFS{
 		"importmap.json": {
 			Data: []byte(`{
@@ -257,12 +255,12 @@ func TestGenerateImportMapHandlesSpecialTargets(t *testing.T) {
 		"js/module.mjs": {Data: []byte(`export {}`)},
 	}
 
-	content, _, err := GenerateImportMap(publicFS, "importmap.json")
+	content, _, err := Generate(FromFS(publicFS, "importmap.json"))
 	if err != nil {
-		t.Fatalf("GenerateImportMap() error = %v", err)
+		t.Fatalf("Generate() error = %v", err)
 	}
 
-	var importMap ImportMap
+	var importMap Map
 	if err := json.Unmarshal([]byte(content), &importMap); err != nil {
 		t.Fatalf("generated invalid JSON: %v", err)
 	}
@@ -281,95 +279,5 @@ func TestGenerateImportMapHandlesSpecialTargets(t *testing.T) {
 	}
 	if got := importMap.Integrity["https://cdn.example.com/lib.js"]; got != "sha384-abc" {
 		t.Errorf("integrity not preserved: %q", got)
-	}
-}
-
-func TestImportmapCache(t *testing.T) {
-	calls := 0
-	cache := NewImportmapCache(func() (string, string, error) {
-		calls++
-		return `{"imports":{}}`, "abc", nil
-	}, false)
-
-	for i := 0; i < 3; i++ {
-		if _, checksum, ok := cache.Get(); !ok || checksum != "abc" {
-			t.Fatalf("Get() = %q, %v", checksum, ok)
-		}
-	}
-	if calls != 1 {
-		t.Fatalf("generator called %d times, want 1", calls)
-	}
-
-	cache.Invalidate()
-	cache.Get()
-	if calls != 2 {
-		t.Fatalf("generator called %d times after Invalidate, want 2", calls)
-	}
-
-	cache.DisableCache = true
-	cache.Get()
-	cache.Get()
-	if calls != 4 {
-		t.Fatalf("generator called %d times with cache disabled, want 4", calls)
-	}
-}
-
-func TestImportmapCacheGeneratorError(t *testing.T) {
-	cache := NewImportmapCache(func() (string, string, error) {
-		return "", "", errors.New("boom")
-	}, false)
-
-	if _, _, ok := cache.Get(); ok {
-		t.Fatal("Get() ok = true, want false")
-	}
-	if got := cache.GetInlineScriptTag(); got != `<script type="importmap">{"imports":{}}</script>` {
-		t.Fatalf("unexpected fallback tag: %s", got)
-	}
-}
-
-func TestHTTPHandler(t *testing.T) {
-	cache := NewCacheFromFS(fstest.MapFS{
-		"importmap.json": {Data: []byte(`{"imports":{}}`)},
-		"app.js":         {Data: []byte(`export {}`)},
-	}, "importmap.json", false)
-	content, checksum, _ := cache.Get()
-	handler := HTTPHandler(cache)
-	etag := `"sha256-` + checksum + `"`
-
-	tests := []struct {
-		name        string
-		target      string
-		ifNoneMatch string
-		wantStatus  int
-		wantCache   string
-	}{
-		{"versioned", "/importmap.json?checksum=" + checksum, "", http.StatusOK, "public, max-age=31536000, immutable"},
-		{"unversioned", "/importmap.json", "", http.StatusOK, "no-cache"},
-		{"stale checksum", "/importmap.json?checksum=old", "", http.StatusOK, "no-cache"},
-		{"not modified", "/importmap.json?checksum=" + checksum, etag, http.StatusNotModified, "public, max-age=31536000, immutable"},
-		{"weak etag in list", "/importmap.json", `"other", W/` + etag, http.StatusNotModified, "no-cache"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
-			if tt.ifNoneMatch != "" {
-				req.Header.Set("If-None-Match", tt.ifNoneMatch)
-			}
-			rec := httptest.NewRecorder()
-			handler(rec, req)
-
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
-			}
-			if got := rec.Header().Get("Cache-Control"); got != tt.wantCache {
-				t.Errorf("Cache-Control = %q, want %q", got, tt.wantCache)
-			}
-			if got := rec.Header().Get("ETag"); got != etag {
-				t.Errorf("ETag = %q, want %q", got, etag)
-			}
-			if tt.wantStatus == http.StatusOK && rec.Body.String() != content {
-				t.Errorf("body = %q, want %q", rec.Body.String(), content)
-			}
-		})
 	}
 }

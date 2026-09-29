@@ -15,10 +15,8 @@ go get bits2life.com/importmaps
 ```
 
 ```go
-import "bits2life.com/importmaps"
+import "bits2life.com/importmaps" // package importmap
 ```
-
-The package name is `importmap`.
 
 ## Usage
 
@@ -30,16 +28,15 @@ The simplest setup serves everything from one filesystem with an
 var public embed.FS
 
 publicFS, _ := fs.Sub(public, "public")
-importmaps := importmap.NewCacheFromFS(publicFS, "importmap.json", development)
+
+importmaps := importmap.New(importmap.FromFS(publicFS, "importmap.json"))
+http.Handle("/importmap.js", importmaps)
 ```
 
-Then put the import map inline in your page template, before any module
-scripts:
+Then add the import map to your page template, before any module scripts:
 
 ```go
-tmpl.Execute(w, map[string]any{
-	"Importmap": template.HTML(importmaps.GetInlineScriptTag()),
-})
+tmpl.Execute(w, map[string]any{"Importmap": importmaps.Script()})
 ```
 
 ```html
@@ -49,20 +46,37 @@ tmpl.Execute(w, map[string]any{
 </head>
 ```
 
-Set `DisableCache` (the last argument above) during development to rebuild
-the map on every request, or call `Invalidate` after files change.
+### Loading the import map
 
-### Several filesystems and aliases
+Browsers don't load import maps from a `src` attribute, so there are two ways
+to get the map into a page:
+
+- **`Script()`** renders `<script src="/importmap.js?checksum=…"></script>`.
+  The Cache serves that URL as a small, immutable script that writes the
+  import map into the page with `document.write`. The map is downloaded once
+  and then cached by the browser, which keeps pages small for applications
+  with many JavaScript files. It costs one blocking request on the first
+  visit. The tag must be in the page's markup (not inserted by script),
+  before any module script.
+- **`InlineScript()`** renders `<script type="importmap">{…}</script>`
+  with the whole map. There's no extra request, but the map is sent with
+  every page.
+
+Both return `template.HTML`. If your Content Security Policy uses nonces,
+build the tag yourself from `ScriptURL()` and add the nonce; the loader
+copies it to the import map it writes.
+
+### Options
 
 Reusable modules can contribute their own filesystems, mounted at URL
 prefixes, plus extra import map files and aliases:
 
 ```go
-importmaps := importmap.NewCache(importmap.CacheOptions{
-	Importmaps: []importmap.ImportmapFile{
+importmaps := importmap.New(importmap.Options{
+	Files: []importmap.File{
 		{FS: publicFS, Path: "importmap.json"},
 	},
-	Sources: []importmap.FileSource{
+	Sources: []importmap.Source{
 		{FS: publicFS, Prefix: "/"},
 		{FS: adminFS, Prefix: "/_admin/assets"},
 	},
@@ -73,33 +87,28 @@ importmaps := importmap.NewCache(importmap.CacheOptions{
 })
 ```
 
-- Later import map files override earlier ones for the same specifier.
+- Later import map files override earlier ones for the same specifier, and
+  aliases override both.
 - Every `.js` and `.mjs` file in each source is added under its web path.
   When prefixes overlap, the longest prefix owns the file.
 - Local targets (`/path/to/file.js`) in `imports`, `scopes` and aliases get a
   checksum. External URLs and prefix mappings (`"lib/": "/lib/"`) are left
   as they are.
+- `DisableCache` rebuilds the map on every use, for development. Otherwise
+  call `Invalidate` after files change.
+- `ScriptPath` sets the URL `Script()` points at, if you mount the handler
+  somewhere other than `/importmap.js`.
+- `Logger` receives warnings about missing files and unresolvable targets
+  (default `slog.Default()`).
 
-Serving the static files themselves is up to you, for example with
-`http.FileServerFS` and a long `Cache-Control` for requests carrying a
+Serving the JavaScript files themselves is up to you, for example with
+`http.FileServerFS`, adding a long `Cache-Control` for requests that carry a
 `checksum` query parameter.
 
 ### Generating without a cache
 
-`GenerateImportMap` and `GenerateImportMapFromSources` return the import map
-JSON and its SHA-256, if you want to write it to disk at build time or cache
-it yourself.
-
-### Serving importmap.json
-
-`HTTPHandler` serves the generated map as `application/importmap+json` with
-an ETag. Requests whose `checksum` query parameter matches the current map
-are marked immutable; all others must revalidate.
-
-Browsers do not currently load external import maps
-(`<script type="importmap" src="…">` is ignored), so `GetScriptTag` and the
-endpoint are mainly useful for tooling and debugging. Use
-`GetInlineScriptTag` in pages.
+`importmap.Generate(opts)` returns the import map JSON and its SHA-256, if
+you want to write it to disk at build time or cache it yourself.
 
 ## How it works
 
@@ -114,12 +123,9 @@ To keep that true:
 1. Import scripts by bare specifier or by path under a known source. Avoid
    building import URLs at runtime or adding your own query strings.
 2. Load the entry module through the import map as well
-   (`<script type="module">import "app";</script>`), or give its `src` a
-   checksummed URL.
+   (`<script type="module">import "app";</script>`). A `src` on a module
+   script is fetched as written, without the import map.
 
-### Import map size
+## License
 
-Listing every script makes the import map larger, and because it is inlined
-it is sent with every page. For most applications this is a few kilobytes
-of well-compressible JSON; in exchange, a change to one script only
-invalidates that script and the page's import map.
+[MIT](LICENSE)
