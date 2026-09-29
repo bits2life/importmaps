@@ -1,6 +1,6 @@
 # importmaps
 
-[![Go Reference](https://pkg.go.dev/badge/bits2life.com/importmaps.svg)](https://pkg.go.dev/bits2life.com/importmaps)
+[![Go Reference](https://pkg.go.dev/badge/go.bits2life.com/importmaps.svg)](https://pkg.go.dev/go.bits2life.com/importmaps)
 
 Cache-busting [import maps](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap)
 for Go web servers.
@@ -11,11 +11,11 @@ Scripts can then be cached aggressively (`immutable`, one year), and clients
 still fetch exactly the files that changed as soon as the import map changes.
 
 ```sh
-go get bits2life.com/importmaps
+go get go.bits2life.com/importmaps
 ```
 
 ```go
-import "bits2life.com/importmaps" // package importmap
+import "go.bits2life.com/importmaps" // package importmap
 ```
 
 ## Usage
