@@ -97,7 +97,7 @@ importmaps := importmap.New(importmap.Options{
 - `Scripts` registers scripts that no filesystem can find, such as ones a
   package generates or serves from its own handler (see below).
 - `DisableCache` rebuilds the map on every use, for development. Otherwise
-  call `Invalidate` after files change.
+  see [Updating scripts](#updating-scripts).
 - `ScriptPath` sets the URL `Script()` points at, if you mount the handler
   somewhere other than `/importmap.js`.
 - `Logger` receives warnings about missing files and unresolvable targets
@@ -124,8 +124,28 @@ importmap.Options{
 }
 ```
 
-`Content` and `Version` are read whenever the map is generated, so call
-`Invalidate` on the Cache when they change.
+Scripts can also be added or replaced later with `Cache.SetScript`.
+
+### Updating scripts
+
+A Cache computes every checksum once. When scripts change while the server
+is running, update the cached map in one of these ways:
+
+```go
+// Recompute the checksums of specific files or registered scripts. New
+// files in a source are added and deleted ones removed.
+err := importmaps.Refresh("/js/app.js", "/_widgets/widget.js")
+
+// Register a script, or replace one, for example with a new Version.
+err = importmaps.SetScript(importmap.Script{Path: "/_widgets/editor.js", Version: newBuildID})
+
+// Rebuild everything, re-reading import map files and walking sources.
+importmaps.Invalidate()
+```
+
+`Refresh` and `SetScript` only touch the given scripts, and aliases and
+scopes pointing at them pick up the new checksum. Pages rendered afterwards
+get the new import map, and `Script()` points at a new loader URL.
 
 Serving the JavaScript files themselves is up to you, for example with
 `http.FileServerFS`, adding a long `Cache-Control` for requests that carry a

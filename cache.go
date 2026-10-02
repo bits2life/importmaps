@@ -2,6 +2,7 @@ package importmap
 
 import (
 	"encoding/json"
+	"errors"
 	"html/template"
 	"net/http"
 	"strings"
@@ -14,13 +15,13 @@ import (
 // A Cache is also an http.Handler serving the loader script that Script
 // references. It is safe for concurrent use.
 type Cache struct {
-	opts Options
-
 	mu    sync.RWMutex
+	opts  Options // Scripts is guarded by mu; the rest is read-only.
 	entry *entry
 }
 
 type entry struct {
+	state    *state // Inputs for Refresh; never modified once cached.
 	content  string // Import map JSON.
 	checksum string // Hex SHA-256 of content.
 	loader   string // JavaScript that writes the import map into the page.
@@ -31,6 +32,7 @@ func New(opts Options) *Cache {
 	if opts.ScriptPath == "" {
 		opts.ScriptPath = "/importmap.js"
 	}
+	opts.Scripts = append([]Script(nil), opts.Scripts...)
 	return &Cache{opts: opts}
 }
 
@@ -46,7 +48,10 @@ func (c *Cache) Get() (content string, checksum string, err error) {
 
 func (c *Cache) get() (*entry, error) {
 	if c.opts.DisableCache {
-		return c.generate()
+		c.mu.RLock()
+		opts := c.opts
+		c.mu.RUnlock()
+		return generate(opts)
 	}
 
 	c.mu.RLock()
@@ -61,7 +66,7 @@ func (c *Cache) get() (*entry, error) {
 	if c.entry != nil {
 		return c.entry, nil
 	}
-	e, err := c.generate()
+	e, err := generate(c.opts)
 	if err != nil {
 		return nil, err
 	}
@@ -69,8 +74,16 @@ func (c *Cache) get() (*entry, error) {
 	return e, nil
 }
 
-func (c *Cache) generate() (*entry, error) {
-	content, checksum, err := Generate(c.opts)
+func generate(opts Options) (*entry, error) {
+	st, err := build(opts)
+	if err != nil {
+		return nil, err
+	}
+	return newEntry(st)
+}
+
+func newEntry(st *state) (*entry, error) {
+	content, checksum, err := st.render()
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +98,84 @@ func (c *Cache) generate() (*entry, error) {
 		"  var s = document.currentScript, n = s && s.nonce;\n" +
 		"  document.write(" + strings.Replace(string(tag), "NONCE", nonce, 1) + ");\n" +
 		"})();\n"
-	return &entry{content: content, checksum: checksum, loader: loader}, nil
+	return &entry{state: st, content: content, checksum: checksum, loader: loader}, nil
+}
+
+// Refresh recomputes the checksums of the scripts at the given URL paths,
+// such as "/js/app.js", and updates the cached import map without
+// rebuilding the rest of it. A path can be a file in a Source or a
+// registered Script; new script files in a Source are added, and files that
+// no longer exist are removed.
+//
+// Refresh returns an error for a path that is neither a Script nor inside a
+// Source, or whose content can't be read; the other paths are still
+// refreshed. It does nothing if the import map hasn't been generated yet or
+// caching is disabled, since the next use computes every checksum anyway.
+func (c *Cache) Refresh(paths ...string) error {
+	if c.opts.DisableCache {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entry == nil {
+		return nil
+	}
+
+	st := c.entry.state.clone()
+	var errs []error
+	for _, p := range paths {
+		p = scriptPath(urlPath(p))
+		if err := st.refresh(p); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		_, registered := st.scripts[p]
+		if _, ok := st.sums[p]; ok && (registered || isScript(p)) {
+			st.listed[p] = true
+		}
+	}
+	e, err := newEntry(st)
+	if err != nil {
+		return err
+	}
+	c.entry = e
+	return errors.Join(errs...)
+}
+
+// SetScript registers s, replacing any Script with the same Path, and
+// updates its checksum in the cached import map without rebuilding the rest
+// of it. Use it to add scripts after the Cache is created, or to change a
+// Script's Version or Content function.
+func (c *Cache) SetScript(s Script) error {
+	p := scriptPath(s.Path)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	scripts := make([]Script, 0, len(c.opts.Scripts)+1)
+	for _, existing := range c.opts.Scripts {
+		if scriptPath(existing.Path) != p {
+			scripts = append(scripts, existing)
+		}
+	}
+	c.opts.Scripts = append(scripts, s)
+
+	if c.opts.DisableCache || c.entry == nil {
+		return nil
+	}
+	st := c.entry.state.clone()
+	st.scripts = make(map[string]Script, len(c.entry.state.scripts)+1)
+	for k, v := range c.entry.state.scripts {
+		st.scripts[k] = v
+	}
+	st.scripts[p] = s
+	st.listed[p] = true
+	refreshErr := st.refresh(p)
+	e, err := newEntry(st)
+	if err != nil {
+		return err
+	}
+	c.entry = e
+	return refreshErr
 }
 
 // Invalidate discards the cached import map, so the next use regenerates it.

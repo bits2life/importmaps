@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -113,8 +114,35 @@ func (o Options) logger() *slog.Logger {
 // Missing or malformed import map files and unresolvable local targets are
 // logged and skipped. Errors walking a Source are returned.
 func Generate(opts Options) (content string, checksum string, err error) {
-	log := opts.logger()
-	m := Map{Imports: make(map[string]string)}
+	st, err := build(opts)
+	if err != nil {
+		return "", "", err
+	}
+	return st.render()
+}
+
+// state is a generated import map before checksums are applied, so that
+// individual checksums can be recomputed without rebuilding everything.
+type state struct {
+	log     *slog.Logger
+	base    Map               // Merged import map files.
+	aliases []Alias           // Applied after listed scripts.
+	sources []source          // Sorted by descending prefix length.
+	scripts map[string]Script // Registered scripts by URL path.
+	listed  map[string]bool   // URL paths added to the import map as keys.
+	sums    map[string]string // Full hex checksums by URL path.
+}
+
+func build(opts Options) (*state, error) {
+	st := &state{
+		log:     opts.logger(),
+		base:    Map{Imports: make(map[string]string)},
+		aliases: opts.Aliases,
+		sources: normalizeSources(opts.Sources),
+		scripts: make(map[string]Script),
+		listed:  make(map[string]bool),
+		sums:    make(map[string]string),
+	}
 
 	for _, f := range opts.Files {
 		if f.FS == nil {
@@ -126,20 +154,18 @@ func Generate(opts Options) (content string, checksum string, err error) {
 		}
 		data, err := fs.ReadFile(f.FS, name)
 		if err != nil {
-			log.Warn("importmap: reading import map file", "path", name, "error", err)
+			st.log.Warn("importmap: reading import map file", "path", name, "error", err)
 			continue
 		}
 		var base Map
 		if err := json.Unmarshal(data, &base); err != nil {
-			log.Warn("importmap: parsing import map file", "path", name, "error", err)
+			st.log.Warn("importmap: parsing import map file", "path", name, "error", err)
 			continue
 		}
-		m.merge(base)
+		st.base.merge(base)
 	}
 
-	sources := normalizeSources(opts.Sources)
-
-	for _, source := range sources {
+	for _, source := range st.sources {
 		err := fs.WalkDir(source.fs, ".", func(name string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -148,45 +174,120 @@ func Generate(opts Options) (content string, checksum string, err error) {
 				return nil
 			}
 			webPath := source.webPath(name)
-			if owner, _, ok := sourceForWebPath(sources, webPath); ok && owner.prefix != source.prefix {
+			if owner, _, ok := sourceForWebPath(st.sources, webPath); ok && owner.prefix != source.prefix {
 				return nil
 			}
-			sum, err := checksumFile(source.fs, name)
-			if err != nil {
-				log.Warn("importmap: checksumming file", "path", webPath, "error", err)
-				return nil
-			}
-			m.Imports[webPath] = withChecksum(webPath, sum)
+			st.listed[webPath] = true
 			return nil
 		})
 		if err != nil {
-			return "", "", fmt.Errorf("importmap: walking source %q: %w", source.prefix+"/", err)
+			return nil, fmt.Errorf("importmap: walking source %q: %w", source.prefix+"/", err)
 		}
 	}
 
-	scripts := make(map[string]string) // Path -> checksum.
 	for _, script := range opts.Scripts {
-		p := "/" + strings.TrimPrefix(strings.TrimSpace(script.Path), "/")
-		sum, err := script.checksum()
-		if err != nil {
-			log.Warn("importmap: checksumming script", "path", p, "error", err)
-			continue
-		}
-		scripts[p] = sum
-		m.Imports[p] = withChecksum(p, sum)
+		p := scriptPath(script.Path)
+		st.scripts[p] = script
+		st.listed[p] = true
 	}
 
-	for _, alias := range opts.Aliases {
+	for p := range st.listed {
+		st.refresh(p)
+	}
+	for _, imports := range st.targets() {
+		for _, v := range imports {
+			if p, ok := st.unresolved(v); ok {
+				st.refresh(p)
+			}
+		}
+	}
+	return st, nil
+}
+
+// targets returns the import tables whose local targets get checksums.
+func (st *state) targets() []map[string]string {
+	tables := []map[string]string{st.base.Imports, {}}
+	for _, a := range st.aliases {
+		tables[1][a.Specifier] = strings.TrimSpace(a.Target)
+	}
+	for _, scope := range st.base.Scopes {
+		tables = append(tables, scope)
+	}
+	return tables
+}
+
+// unresolved reports whether target v needs a checksum, and its URL path.
+func (st *state) unresolved(v string) (string, bool) {
+	if !isLocalTarget(v) || strings.Contains(v, "checksum=") {
+		return "", false
+	}
+	return urlPath(v), true
+}
+
+// refresh recomputes the checksum of the script at URL path p, removing it
+// from the import map if it no longer exists. It returns an error if p is
+// neither a registered script nor inside a source.
+func (st *state) refresh(p string) error {
+	sum, err := st.checksum(p)
+	switch {
+	case err == nil:
+		st.sums[p] = sum
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		delete(st.sums, p)
+		delete(st.listed, p)
+		st.log.Warn("importmap: script not found", "path", p)
+		return nil
+	default:
+		delete(st.sums, p)
+		st.log.Warn("importmap: checksumming script", "path", p, "error", err)
+		return err
+	}
+}
+
+func (st *state) checksum(p string) (string, error) {
+	if script, ok := st.scripts[p]; ok {
+		return script.checksum()
+	}
+	src, name, ok := sourceForWebPath(st.sources, p)
+	if !ok {
+		return "", fmt.Errorf("importmap: no script or source for %q", p)
+	}
+	return checksumFile(src.fs, name)
+}
+
+// render applies the current checksums and returns the import map JSON and
+// its hex SHA-256.
+func (st *state) render() (content string, checksum string, err error) {
+	m := Map{
+		Imports:   make(map[string]string, len(st.base.Imports)+len(st.listed)),
+		Integrity: st.base.Integrity,
+	}
+	for k, v := range st.base.Imports {
+		m.Imports[k] = v
+	}
+	for p := range st.listed {
+		if sum, ok := st.sums[p]; ok {
+			m.Imports[p] = withChecksum(p, sum)
+		}
+	}
+	for _, alias := range st.aliases {
 		specifier := strings.TrimSpace(alias.Specifier)
 		target := strings.TrimSpace(alias.Target)
 		if specifier != "" && target != "" {
 			m.Imports[specifier] = target
 		}
 	}
-
-	checksumTargets(m.Imports, scripts, sources, log)
-	for _, scope := range m.Scopes {
-		checksumTargets(scope, scripts, sources, log)
+	st.checksumTargets(m.Imports)
+	for scope, imports := range st.base.Scopes {
+		if m.Scopes == nil {
+			m.Scopes = make(map[string]map[string]string)
+		}
+		m.Scopes[scope] = make(map[string]string, len(imports))
+		for k, v := range imports {
+			m.Scopes[scope][k] = v
+		}
+		st.checksumTargets(m.Scopes[scope])
 	}
 
 	result, err := json.MarshalIndent(m, "", "  ")
@@ -195,6 +296,24 @@ func Generate(opts Options) (content string, checksum string, err error) {
 	}
 	sum := sha256.Sum256(result)
 	return string(result), hex.EncodeToString(sum[:]), nil
+}
+
+// checksumTargets adds a checksum to every local, non-prefix target in
+// imports that doesn't already carry one.
+func (st *state) checksumTargets(imports map[string]string) {
+	for k, v := range imports {
+		p, ok := st.unresolved(v)
+		if !ok {
+			continue
+		}
+		if sum, ok := st.sums[p]; ok {
+			imports[k] = withChecksum(v, sum)
+		}
+	}
+}
+
+func scriptPath(p string) string {
+	return "/" + strings.TrimPrefix(strings.TrimSpace(p), "/")
 }
 
 // merge copies the entries of src into m, overriding existing keys.
@@ -218,31 +337,6 @@ func (m *Map) merge(src Map) {
 			m.Integrity = make(map[string]string)
 		}
 		m.Integrity[k] = v
-	}
-}
-
-// checksumTargets adds a checksum to every local, non-prefix target in
-// imports that doesn't already carry one.
-func checksumTargets(imports map[string]string, scripts map[string]string, sources []source, log *slog.Logger) {
-	for k, v := range imports {
-		if !isLocalTarget(v) || strings.Contains(v, "checksum=") {
-			continue
-		}
-		if sum, ok := scripts[urlPath(v)]; ok {
-			imports[k] = withChecksum(v, sum)
-			continue
-		}
-		src, name, ok := sourceForWebPath(sources, v)
-		if !ok {
-			log.Warn("importmap: no source for import target", "target", v)
-			continue
-		}
-		sum, err := checksumFile(src.fs, name)
-		if err != nil {
-			log.Warn("importmap: checksumming import target", "target", v, "error", err)
-			continue
-		}
-		imports[k] = withChecksum(v, sum)
 	}
 }
 
@@ -341,4 +435,18 @@ func checksumFile(fsys fs.FS, name string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// clone returns a copy of st whose checksums can be changed independently.
+func (st *state) clone() *state {
+	c := *st
+	c.listed = make(map[string]bool, len(st.listed))
+	for k, v := range st.listed {
+		c.listed[k] = v
+	}
+	c.sums = make(map[string]string, len(st.sums))
+	for k, v := range st.sums {
+		c.sums[k] = v
+	}
+	return &c
 }

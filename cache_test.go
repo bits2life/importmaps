@@ -1,13 +1,16 @@
 package importmap
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 )
@@ -157,4 +160,152 @@ func TestCacheServeHTTP(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCacheRefresh(t *testing.T) {
+	fsys := &countingFS{MapFS: fstest.MapFS{
+		"importmap.json": {Data: []byte(`{"imports":{"app":"/js/app.js"},"scopes":{"/legacy/":{"app":"/js/app.js"}}}`)},
+		"js/app.js":      {Data: []byte(`export const v = 1`)},
+		"js/other.js":    {Data: []byte(`export {}`)},
+		"js/gone.js":     {Data: []byte(`export {}`)},
+	}}
+	widget := []byte(`export const w = 1`)
+	opts := FromFS(fsys, "importmap.json")
+	opts.Scripts = []Script{{Path: "/plugin/widget.js", Content: func() ([]byte, error) { return widget, nil }}}
+	opts.Aliases = []Alias{{Specifier: "widget", Target: "/plugin/widget.js"}}
+	opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cache := New(opts)
+
+	if err := cache.Refresh("/js/app.js"); err != nil {
+		t.Fatalf("Refresh() before first use error = %v", err)
+	}
+	if fsys.opens != 0 {
+		t.Fatalf("Refresh() before first use generated the import map")
+	}
+
+	before := mustMap(t, cache)
+
+	fsys.MapFS["js/app.js"] = &fstest.MapFile{Data: []byte(`export const v = 2`)}
+	fsys.MapFS["js/new.js"] = &fstest.MapFile{Data: []byte(`export {}`)}
+	delete(fsys.MapFS, "js/gone.js")
+	widget = []byte(`export const w = 2`)
+
+	if got := mustMap(t, cache); got.Imports["app"] != before.Imports["app"] {
+		t.Fatal("cached import map changed before Refresh")
+	}
+
+	if err := cache.Refresh("/js/app.js?checksum=old", "js/new.js", "/js/gone.js", "/plugin/widget.js"); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	after := mustMap(t, cache)
+
+	if fsys.opens != 1 {
+		t.Errorf("Refresh() rebuilt the import map (%d generations)", fsys.opens)
+	}
+	for _, k := range []string{"app", "/js/app.js", "widget", "/plugin/widget.js"} {
+		if after.Imports[k] == before.Imports[k] {
+			t.Errorf("%s not refreshed: %q", k, after.Imports[k])
+		}
+	}
+	if after.Imports["app"] != after.Imports["/js/app.js"] || after.Scopes["/legacy/"]["app"] != after.Imports["/js/app.js"] {
+		t.Errorf("targets of /js/app.js disagree: %v", after)
+	}
+	if after.Imports["/js/other.js"] != before.Imports["/js/other.js"] {
+		t.Errorf("unrelated script changed: %q", after.Imports["/js/other.js"])
+	}
+	if got := after.Imports["/js/new.js"]; !strings.HasPrefix(got, "/js/new.js?checksum=") {
+		t.Errorf("new script not added: %q", got)
+	}
+	if _, ok := after.Imports["/js/gone.js"]; ok {
+		t.Error("removed script still in import map")
+	}
+
+	_, checksum, _ := cache.Get()
+	if got := string(cache.Script()); !strings.Contains(got, checksum) {
+		t.Errorf("Script() not updated to new checksum: %s", got)
+	}
+
+	prefixed := New(Options{
+		Sources: []Source{{FS: testFS(), Prefix: "/assets"}},
+		Logger:  opts.Logger,
+	})
+	prefixed.Get()
+	if err := prefixed.Refresh("/other/x.js"); err == nil {
+		t.Error("Refresh() of a path outside any source: error = nil")
+	}
+}
+
+func mustMap(t *testing.T, cache *Cache) Map {
+	t.Helper()
+	content, _, err := cache.Get()
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	var m Map
+	if err := json.Unmarshal([]byte(content), &m); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	return m
+}
+
+func TestCacheSetScript(t *testing.T) {
+	cache := New(Options{
+		Scripts: []Script{{Path: "/plugin/a.js", Version: "1"}},
+		Aliases: []Alias{{Specifier: "a", Target: "/plugin/a.js"}, {Specifier: "b", Target: "/plugin/b.js"}},
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// Before first use, the script is simply registered.
+	if err := cache.SetScript(Script{Path: "plugin/b.js", Version: "1"}); err != nil {
+		t.Fatalf("SetScript() error = %v", err)
+	}
+	before := mustMap(t, cache)
+	if !strings.HasPrefix(before.Imports["b"], "/plugin/b.js?checksum=") {
+		t.Fatalf("script set before first use missing: %v", before.Imports)
+	}
+
+	if err := cache.SetScript(Script{Path: "/plugin/a.js", Version: "2"}); err != nil {
+		t.Fatalf("SetScript() error = %v", err)
+	}
+	if err := cache.SetScript(Script{Path: "/plugin/c.js", Content: func() ([]byte, error) { return []byte("c"), nil }}); err != nil {
+		t.Fatalf("SetScript() error = %v", err)
+	}
+	after := mustMap(t, cache)
+	if after.Imports["a"] == before.Imports["a"] || after.Imports["/plugin/a.js"] != after.Imports["a"] {
+		t.Errorf("new version not applied: %v", after.Imports)
+	}
+	if after.Imports["b"] != before.Imports["b"] {
+		t.Errorf("unrelated script changed: %q", after.Imports["b"])
+	}
+	if !strings.HasPrefix(after.Imports["/plugin/c.js"], "/plugin/c.js?checksum=") {
+		t.Errorf("script added after first use missing: %v", after.Imports)
+	}
+
+	cache.Invalidate()
+	if rebuilt := mustMap(t, cache); rebuilt.Imports["a"] != after.Imports["a"] || rebuilt.Imports["/plugin/c.js"] != after.Imports["/plugin/c.js"] {
+		t.Errorf("scripts set with SetScript lost after Invalidate: %v", rebuilt.Imports)
+	}
+}
+
+func TestCacheConcurrentUpdates(t *testing.T) {
+	cache := New(Options{
+		Scripts: []Script{{Path: "/a.js", Version: "0"}},
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				cache.Get()
+				cache.SetScript(Script{Path: "/a.js", Version: strconv.Itoa(i*100 + j)})
+				cache.Refresh("/a.js")
+				if j%10 == 0 {
+					cache.Invalidate()
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
 }
