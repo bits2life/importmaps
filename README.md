@@ -30,8 +30,11 @@ var public embed.FS
 publicFS, _ := fs.Sub(public, "public")
 
 importmaps := importmap.New(importmap.FromFS(publicFS, "importmap.json"))
-http.Handle("/importmap.js", importmaps)
+http.Handle("/", importmaps.Middleware(http.FileServerFS(publicFS)))
 ```
+
+The middleware serves the import map loader at `/importmap.js` and sets
+caching headers on your scripts (see [Serving scripts](#serving-scripts)).
 
 Then add the import map to your page template, before any module scripts:
 
@@ -98,8 +101,8 @@ importmaps := importmap.New(importmap.Options{
   package generates or serves from its own handler (see below).
 - `DisableCache` rebuilds the map on every use, for development. Otherwise
   see [Updating scripts](#updating-scripts).
-- `ScriptPath` sets the URL `Script()` points at, if you mount the handler
-  somewhere other than `/importmap.js`.
+- `ScriptPath` is the loader URL used by `Script()` and the middleware
+  (default `/importmap.js`).
 - `Logger` receives warnings about missing files and unresolvable targets
   (default `slog.Default()`).
 
@@ -147,9 +150,50 @@ importmaps.Invalidate()
 scopes pointing at them pick up the new checksum. Pages rendered afterwards
 get the new import map, and `Script()` points at a new loader URL.
 
-Serving the JavaScript files themselves is up to you, for example with
-`http.FileServerFS`, adding a long `Cache-Control` for requests that carry a
-`checksum` query parameter.
+#### From another process
+
+When scripts are changed by a different process than the one holding the
+Cache, mount `RefreshHandler` and have that process call it after each
+write:
+
+```http
+POST /_importmap/refresh
+Content-Type: application/json
+
+{"paths": ["/js/app.js"]}
+```
+
+```json
+{"urls": {"/js/app.js": "/js/app.js?checksum=9c1e…"}, "checksum": "…"}
+```
+
+The response carries each script's new URL (empty if it was deleted), for
+example so an editor can `import()` the new version. Anyone who can reach
+the endpoint can make the server re-read files, so mount it where only
+trusted callers can reach it, such as an internal listener or behind your
+own authentication.
+
+### Serving scripts
+
+`Cache.Middleware` wraps whatever serves your JavaScript files, such as
+`http.FileServerFS`, and handles caching for every script in the import
+map:
+
+- A request whose `checksum` matches the script's current content is
+  cached for a year as `immutable`.
+- A request without a checksum, or with an outdated one, gets `no-cache`,
+  so an old URL never caches new content for long.
+- Responses carry an ETag based on the checksum, and matching
+  `If-None-Match` requests get `304 Not Modified` without reaching your
+  handler.
+- Requests for `ScriptPath` get the loader script, and everything else
+  passes through untouched.
+
+With `DisableCache`, scripts always get `no-cache`. Wrap the middleware
+outside any `http.StripPrefix`, since it matches the full URL path.
+
+`Cache.URL("/js/app.js")` returns a script's current checksummed URL, for
+example for a `<link rel="modulepreload">`.
 
 ### Generating without a cache
 
